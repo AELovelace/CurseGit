@@ -164,6 +164,7 @@ class AppSmoke(unittest.TestCase):
             mock.patch.object(curses, "endwin", lambda: None),
             mock.patch.object(curses, "resize_term", lambda *a: None, create=True),
             mock.patch.object(curses, "mousemask", lambda m: (m, 0)),
+            mock.patch.object(curses, "mouseinterval", lambda ms: 0),
             mock.patch.object(curses, "getmouse", harness.getmouse),
             mock.patch("builtins.input", lambda *a: ""),
             mock.patch("webbrowser.open", lambda url: True),

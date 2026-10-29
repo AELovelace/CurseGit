@@ -24,6 +24,8 @@ class ListPane:
         self.rows: list[Row] = []
         self.cursor = 0
         self.top = 0
+        self._code_width = 2
+        self._has_codes = False
 
     # -- content ------------------------------------------------------------
 
@@ -31,6 +33,8 @@ class ListPane:
         old = self.selected
         old_key = old.key if old is not None else None
         self.rows = rows
+        self._has_codes = any(row.code for row in rows)
+        self._code_width = max((len(row.code) for row in rows), default=0) or 2
         idx = None
         if old_key is not None:
             for i, r in enumerate(rows):
@@ -65,12 +69,12 @@ class ListPane:
 
     @property
     def has_code_column(self) -> bool:
-        return any(r.code for r in self.rows)
+        return self._has_codes
 
     @property
     def code_width(self) -> int:
         """Width of the status/hash column: widest code, at least 2."""
-        return max((len(r.code) for r in self.rows), default=0) or 2
+        return self._code_width
 
     # -- navigation ---------------------------------------------------------
 
@@ -187,7 +191,7 @@ class TextPane:
                 break
             line = self.lines[idx]
             attr = diff_attr(line) if colorize else 0
-            line = sanitize(line)
             if self.left:
-                line = skip_cells(line, self.left)
+                line = skip_cells(sanitize(line, max_cells=self.left + w + 2), self.left)
+            # put() sanitizes only the visible prefix; don't rescan the whole diff line here.
             put(win, y + i, x, line, attr, w)

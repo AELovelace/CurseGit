@@ -64,7 +64,7 @@ def _launch(repo, path: str, refresh: float, tty: bool, mouse: bool = True) -> i
     from .ui.welcome import welcome
 
     def run(scr):
-        target = repo if repo is not None else welcome(scr, path)
+        target = repo if repo is not None else welcome(scr, path, mouse=mouse)
         if target is None:
             return
         App(target, refresh_interval=refresh, tty_mode=tty, mouse=mouse).run(scr)

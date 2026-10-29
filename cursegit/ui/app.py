@@ -1,6 +1,8 @@
 """The main curses application: layout, key dispatch, and the actions behind every key."""
 from __future__ import annotations
 
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 import contextlib
 import curses
 import os
@@ -13,7 +15,7 @@ from ..git import GitError, GitRepo
 from ..model import Branch, Commit, FileChange, RepoState, Section, Stash
 from ..worker import Worker
 from . import keys, popups
-from .draw import (CLICK, DOUBLE_CLICK, WHEEL_DOWN, WHEEL_UP, disable_mouse, display_width, enable_mouse,
+from .draw import (CLICK, DOUBLE_CLICK, RIGHT_CLICK, WHEEL_DOWN, WHEEL_UP, disable_mouse, display_width, enable_mouse,
                    hline, key_name, put, read_key, read_mouse, vline)
 from .panes import ListPane, Row, TextPane
 from .theme import A, code_attr, init_theme
@@ -64,6 +66,17 @@ class App:
         self.running = True
         self.scr = None
         self.body_h = 10
+        self._last_click = (0.0, None)  # Timestamp and row identity for immediate Windows double-clicks.
+        self._next_spin = 0.0
+        self._reads = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cursegit-read")
+        self._detail_future = None
+        self._refresh_future = None
+        self._pending_detail = None
+        self._detail_serial = 0
+        self._detail_due = 0.0
+        self._epoch = 0
+        self._detail_cache = OrderedDict()
+        self._displayed_detail_key = None
 
     # -- properties -----------------------------------------------------------
 
@@ -82,6 +95,13 @@ class App:
     # -- main loop ------------------------------------------------------------
 
     def run(self, scr) -> None:
+        """Own the read worker's lifetime so closing the UI never leaves reads behind."""
+        try:
+            self._run(scr)
+        finally:
+            self._reads.shutdown(wait=True, cancel_futures=True)
+
+    def _run(self, scr) -> None:
         self.scr = scr
         try:
             curses.curs_set(0)
@@ -97,13 +117,19 @@ class App:
             self.mouse_on = enable_mouse()
         self.refresh()
         while self.running:
-            if self.need_draw or self.worker.busy:
+            self._poll_reads()
+            reading = self._pending_detail or self._detail_future or self._refresh_future
+            scr.timeout(30 if reading or self.worker.busy else 250)
+            now = time.monotonic()
+            if self.need_draw or (self.worker.busy and now >= self._next_spin):
                 self.draw()
                 self.need_draw = False
+                self._next_spin = now + 0.1  # Spinner updates at 10 Hz, regardless of input rate.
             k = read_key(scr)
             if k is not None:
-                self.need_draw = True
                 name = key_name(k)
+                if name != "mouse":
+                    self.need_draw = True
                 if name == "resize":
                     self.on_resize()
                 elif name == "mouse":
@@ -120,7 +146,7 @@ class App:
                 self.on_done(done)
             if (self.refresh_interval > 0 and not self.worker.busy
                     and time.monotonic() - self.last_refresh > self.refresh_interval):
-                self.refresh()
+                self._request_refresh()  # Status scans run beside the UI, not inside input dispatch.
 
     def on_resize(self) -> None:
         if hasattr(curses, "resize_term"):
@@ -144,6 +170,8 @@ class App:
     # -- data -----------------------------------------------------------------
 
     def refresh(self) -> None:
+        self._epoch += 1
+        self._detail_cache.clear()  # Mutations/manual refresh invalidate cached previews and in-flight results.
         try:
             self.state = self.repo.status()
         except GitError as e:
@@ -226,22 +254,95 @@ class App:
         return rows
 
     def update_detail(self, force: bool = False) -> None:
+        """Queue only the latest selection; bursts of wheel/arrow input don't run one diff per row."""
         row = self.list.selected
         key = (self.tab, row.key if row else None)
-        same = key == self.detail_key
-        if same and not force:
+        if key == self.detail_key and not force:
             return
         self.detail_key = key
+        self._detail_serial += 1
+        self._pending_detail = None
+        if force:
+            self._detail_cache.pop(key, None)
         if row is None:
             self.text.set_text("")
             self.detail_title = ""
-            return
-        try:
-            text, title = self._detail_for(row.data)
-        except GitError as e:
-            text, title = e.output, "error"
-        self.text.set_text(text, keep_scroll=same)
-        self.detail_title = title
+            self._displayed_detail_key = None
+        elif key in self._detail_cache:
+            text, self.detail_title = self._detail_cache[key]
+            self._detail_cache.move_to_end(key)
+            self.text.set_text(text)
+            self._displayed_detail_key = key
+        else:
+            if self._displayed_detail_key != key:
+                self.text.set_text("Loading preview...")
+                self.detail_title = row.text
+            self._pending_detail = (self._detail_serial, self._epoch, key, row.data)
+            self._detail_due = time.monotonic() + 0.06
+        self.need_draw = True
+
+    def _read_state(self, tab):
+        """Read Git data only; background jobs never access curses or mutate UI state."""
+        state = self.repo.status()
+        remotes = bool(self.repo.remotes())
+        branches = self.repo.branches() if tab == 1 else None
+        commits = self.repo.log() if tab == 3 else None
+        return state, remotes, branches, commits
+
+    def _request_refresh(self) -> None:
+        """Allow at most one periodic status scan to be queued or running."""
+        if self._refresh_future is None:
+            self._refresh_future = (self._epoch, self.tab, self._reads.submit(self._read_state, self.tab))
+            self.last_refresh = time.monotonic()
+
+    def _poll_reads(self) -> None:
+        """Apply finished reads only if their project state and selected row are still current."""
+        if self._refresh_future is not None:
+            epoch, tab, future = self._refresh_future
+            if future.done():
+                self._refresh_future = None
+                self.last_refresh = time.monotonic()  # Slow scans must leave time for previews before the next scan.
+                if epoch == self._epoch and tab == self.tab and not self.worker.busy:
+                    try:
+                        self.state, self.has_remote, branches, commits = future.result()
+                    except Exception as exc:
+                        self.note(f"Refresh failed: {exc}", err=True)
+                    else:
+                        self._epoch += 1
+                        self._detail_cache.clear()
+                        self.mark_stale()
+                        if branches is not None:
+                            self.branches, self.stale["branches"] = branches, False
+                        if commits is not None:
+                            self.commits, self.stale["log"] = commits, False
+                        self.rebuild_rows()
+                        self.update_detail(force=True)
+                        self.need_draw = True
+        if self._detail_future is not None:
+            serial, epoch, key, future = self._detail_future
+            if future.done():
+                self._detail_future = None
+                if serial == self._detail_serial and epoch == self._epoch:
+                    try:
+                        text, title = future.result()
+                    except GitError as exc:
+                        text, title = exc.output, "error"
+                    except Exception as exc:
+                        text, title = str(exc), "preview error"
+                    else:
+                        if len(text) <= 1_000_000:
+                            self._detail_cache[key] = (text, title)
+                            self._detail_cache.move_to_end(key)
+                            while len(self._detail_cache) > 16:
+                                self._detail_cache.popitem(last=False)
+                    self.text.set_text(text, keep_scroll=self._displayed_detail_key == key)
+                    self.detail_title, self._displayed_detail_key = title, key
+                    self.need_draw = True
+        if (self._pending_detail is not None and self._detail_future is None
+                and time.monotonic() >= self._detail_due):
+            serial, epoch, key, data = self._pending_detail
+            self._pending_detail = None
+            self._detail_future = (serial, epoch, key, self._reads.submit(self._detail_for, data))
 
     def _detail_for(self, data) -> tuple[str, str]:
         if isinstance(data, FileChange):
@@ -266,7 +367,7 @@ class App:
         self.spin = (self.spin + 1) % len(SPINNER)
         self._draw_header(W)
         self._draw_tabs(W)
-        body_y, body_h = 2, H - 3
+        body_y, body_h = 2, H - 4
         self.body_h = max(1, body_h)
         self.geom.update(body_y=body_y, body_h=body_h, width=W, height=H, split=self.split, list_w=W)
         if body_h >= 1:
@@ -283,6 +384,7 @@ class App:
                 self.text.draw(scr, body_y + 1, tx + 1, body_h - 1, tw - 1)
             else:
                 self.list.draw(scr, body_y, 0, body_h, W, True)
+        self._draw_actions(H, W)
         self._draw_status(H, W)
         scr.refresh()
         if self.pending_login is not None:
@@ -359,14 +461,68 @@ class App:
         if hint_x >= (msg_w + 3 if self.msg else 1):
             put(self.scr, H - 1, hint_x, hint, A["dim"], hint_w)
 
+    def _mouse_actions(self) -> list[tuple[str, str]]:
+        """Keep buttons and the mouse menu on the same guarded action paths as keys."""
+        scoped = {
+            "status": [("Stage", "stage"), ("Unstage", "unstage"), ("Commit", "commit"),
+                       ("Stage all", "stage_all"), ("Discard", "discard")],
+            "branches": [("Checkout", "switch"), ("New", "new_branch"),
+                         ("Merge", "merge"), ("Delete", "delete_branch")],
+            "stash": [("Apply", "stash_apply"), ("Pop", "stash_pop"), ("Drop", "stash_drop")],
+            "log": [("Show", "open_detail"), ("Branch here", "branch_at")],
+        }
+        return scoped[self.scope] + [
+            ("Pull", "pull"), ("Push", "push"), ("Fetch", "fetch"),
+            ("Refresh", "refresh"), ("GitHub", "github"), ("Help", "help"), ("Quit", "quit"),
+        ]
+
+    def _draw_actions(self, height: int, width: int) -> None:
+        """Draw clickable controls and retain their exact cell rectangles for hit testing."""
+        self.geom["actions"] = []
+        x, y = 1, height - 2
+        if y < 2:
+            return
+        for label, action in [("Actions", "action_menu"), *self._mouse_actions()]:
+            text = f"[{label}]"
+            size = display_width(text)
+            if x + size >= width:
+                break
+            put(self.scr, y, x, text, A["hint"], size)
+            self.geom["actions"].append((x, x + size, y, action))
+            x += size + 1
+
+    def act_action_menu(self) -> None:
+        """Offer all actions when the window is too narrow for the button row."""
+        actions = self._mouse_actions()
+        seen = {action for _, action in actions}
+        extra = keys.MUTATING_ACTIONS | {"open_detail", "last_output", "open_remote", "toggle_mouse", "toggle_tty"}
+        for binding in keys.BINDINGS:
+            if binding.scope in (self.scope, "global") and binding.action in extra and binding.action not in seen:
+                actions.append((binding.help, binding.action))
+                seen.add(binding.action)
+        choice = popups.pick(self.scr, "Actions", [label for label, _ in actions])
+        if choice is not None:
+            self.handle_action(actions[choice][1])
+        self.need_draw = True
+
     # -- mouse ------------------------------------------------------------------
 
     def on_mouse(self) -> None:
         ev = read_mouse()
-        if ev is None or not self.geom:
+        if ev is None or not self.geom or self.pending_login is not None:
             return
         x, y, b = ev
         g = self.geom
+        if not (0 <= x < g["width"] and 0 <= y < g["height"]):
+            return
+        if not (b & (CLICK | DOUBLE_CLICK | RIGHT_CLICK | WHEEL_UP | WHEEL_DOWN)):
+            return  # Releases and pointer motion never trigger another action or redraw.
+        self.need_draw = True
+        if b & (CLICK | DOUBLE_CLICK):
+            for x0, x1, ay, action in g.get("actions", []):
+                if y == ay and x0 <= x < x1:
+                    self.handle_action(action)
+                    return
         body_y, body_h = g["body_y"], g["body_h"]
         in_body = body_y <= y < body_y + body_h
         over_detail = in_body and g["split"] and x > g["list_w"]
@@ -378,6 +534,15 @@ class App:
             elif in_body:
                 self.list.move(step)
                 self.update_detail()
+            return
+
+        if b & RIGHT_CLICK:
+            if in_body and not over_detail:
+                idx = self.list.index_at(y - body_y)
+                if idx is not None:
+                    self.list.select(idx)
+                    self.update_detail()
+            self.act_action_menu()
             return
 
         if not (b & CLICK or b & DOUBLE_CLICK):
@@ -401,7 +566,12 @@ class App:
                 return
             self.list.select(idx)
             self.update_detail()
-            if b & DOUBLE_CLICK:
+            now = time.monotonic()
+            identity = (self.tab, self.list.selected.key, x, y)
+            when, previous = self._last_click
+            double = bool(b & DOUBLE_CLICK) or (identity == previous and now - when <= 0.4)
+            self._last_click = (0.0, None) if double else (now, identity)
+            if double:
                 action = keys.lookup("enter", self.scope)
                 if action:
                     self.handle_action(action)
@@ -526,7 +696,11 @@ class App:
     def act_open_detail(self) -> None:
         if self.list.selected is None:
             return
-        popups.show_text(self.scr, self.detail_title, "\n".join(self.text.lines))
+        if self._displayed_detail_key != self.detail_key:
+            text, title = self._detail_for(self.list.selected.data)  # Explicit Open waits for that exact row.
+        else:
+            text, title = "\n".join(self.text.lines), self.detail_title
+        popups.show_text(self.scr, title, text)
 
     def act_last_output(self) -> None:
         popups.show_text(self.scr, "Last git output", self.last_output or "(nothing yet)")

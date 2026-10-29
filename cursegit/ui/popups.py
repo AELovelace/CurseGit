@@ -7,7 +7,7 @@ from __future__ import annotations
 import curses
 import textwrap
 
-from .draw import (WHEEL_DOWN, WHEEL_UP, cell_width, display_width, fit, key_name, put, read_key,
+from .draw import (CLICK, DOUBLE_CLICK, WHEEL_DOWN, WHEEL_UP, cell_width, display_width, fit, key_name, put, read_key,
                    read_mouse, sanitize)
 from .panes import ListPane, Row, TextPane
 from .theme import A
@@ -56,10 +56,22 @@ def _wrap(text: str, width: int) -> list[str]:
     return out
 
 
+def _local_mouse(scr, win):
+    """Translate screen-wide curses mouse coordinates into the centered popup."""
+    ev = read_mouse()
+    if ev is None:
+        return None
+    x, y, buttons = ev
+    H, W = scr.getmaxyx()
+    h, w = win.getmaxyx()
+    x, y = x - (W - w) // 2, y - (H - h) // 2
+    return (x, y, buttons) if 0 <= x < w and 0 <= y < h else None
+
+
 # -- confirm ----------------------------------------------------------------
 
 def confirm(scr, title: str, text: str, danger: bool = False) -> bool:
-    """Yes/no. With danger=True only an explicit 'y' confirms (Enter does not)."""
+    """Yes/no. Dangerous actions require an explicit Yes click or 'y'; Enter cannot confirm."""
     while True:
         H, W = scr.getmaxyx()
         width = min(max(44, min(len(text) + 6, 76)), W - 2)
@@ -67,10 +79,20 @@ def confirm(scr, title: str, text: str, danger: bool = False) -> bool:
         win, h, w = _box(scr, len(lines) + 4, width, title)
         for i, ln in enumerate(lines):
             put(win, 1 + i, 2, ln, 0, w - 4)
-        hint = "[y] yes   [n] no" if danger else "[y/Enter] yes   [n/Esc] no"
+        yes = "[y] yes" if danger else "[y/Enter] yes"
+        no = "[n] no" if danger else "[n/Esc] no"
+        hint = yes + "   " + no
         put(win, h - 2, 2, hint, A["error"] if danger else A["hint"], w - 4)
         win.refresh()
         name = key_name(read_key(win))
+        if name == "mouse":
+            ev = _local_mouse(scr, win)
+            if ev and ev[1] == h - 2 and ev[2] & (CLICK | DOUBLE_CLICK):
+                if 2 <= ev[0] < 2 + len(yes):
+                    return True
+                if 5 + len(yes) <= ev[0] < 5 + len(yes) + len(no):
+                    return False
+            continue
         if name in ("y", "Y") or (name == "enter" and not danger):
             return True
         if name in ("n", "N", "esc", "q"):
@@ -119,7 +141,7 @@ def edit_text(scr, title: str, initial: str = "", single_line: bool = False,
                 shown = "*" * len(lines[idx]) if secret else sanitize(lines[idx])
                 visible = _skip_cells_str(shown, left)
                 put(win, 1 + i, 2, visible, 0, cols)
-            _footer(win, h, w, hint)
+            _footer(win, h, w, "[Save] [Cancel]  " + hint)
             try:
                 win.move(1 + (cy - top), 2 + min(cols - 1, cur_cells - left))
             except curses.error:
@@ -128,6 +150,23 @@ def edit_text(scr, title: str, initial: str = "", single_line: bool = False,
 
             k = read_key(win)
             name = key_name(k)
+            if name == "mouse":
+                ev = _local_mouse(scr, win)
+                if ev and ev[2] & (CLICK | DOUBLE_CLICK):
+                    mx, my, _ = ev
+                    if my == h - 1 and 3 <= mx < 9:
+                        return "\n".join(lines)
+                    if my == h - 1 and 10 <= mx < 18:
+                        return None
+                    if 1 <= my <= rows and 2 <= mx < w - 2:
+                        cy = min(len(lines) - 1, top + my - 1)
+                        target, used, cx = left + mx - 2, 0, 0
+                        for char in lines[cy]:
+                            size = 1 if secret else (4 if char == "\t" else cell_width(char))
+                            if used + size > target:
+                                break
+                            used, cx = used + size, cx + 1
+                continue
             if name == "esc":
                 return None
             if name == "ctrl-s" or (name == "enter" and single_line):
@@ -221,14 +260,16 @@ def show_text(scr, title: str, text: str, colorize: bool = True) -> None:
         win, h, w = _box(scr, H - 2, W - 2, title)
         rows = h - 2
         pane.draw(win, 1, 2, rows, w - 4, colorize)
-        _footer(win, h, w, f"{pane.position(rows)}   j/k scroll   PgUp/PgDn   g/G   q/Esc close")
+        _footer(win, h, w, f"[Close] {pane.position(rows)}   j/k scroll   PgUp/PgDn   g/G   q/Esc close")
         win.refresh()
         name = key_name(read_key(win))
         if name in ("q", "esc", "enter"):
             return
         if name == "mouse":
-            ev = read_mouse()
+            ev = _local_mouse(scr, win)
             if ev is not None:
+                if ev[1] == h - 1 and 3 <= ev[0] < 10 and ev[2] & (CLICK | DOUBLE_CLICK):
+                    return
                 if ev[2] & WHEEL_UP:
                     pane.scroll(-3, rows)
                 elif ev[2] & WHEEL_DOWN:
@@ -263,9 +304,26 @@ def pick(scr, title: str, options: list[str]) -> int | None:
         win, h, w = _box(scr, len(options) + 3, width, title)
         rows = h - 2
         pane.draw(win, 1, 1, rows, w - 2, True)
-        _footer(win, h, w, "Enter: choose   Esc: cancel")
+        _footer(win, h, w, "[Cancel]  Click/Enter: choose")
         win.refresh()
         name = key_name(read_key(win))
+        if name == "mouse":
+            ev = _local_mouse(scr, win)
+            if ev:
+                mx, my, buttons = ev
+                if buttons & WHEEL_UP:
+                    pane.move(-3)
+                elif buttons & WHEEL_DOWN:
+                    pane.move(3)
+                elif buttons & (CLICK | DOUBLE_CLICK):
+                    if my == h - 1 and 3 <= mx < 11:
+                        return None
+                    if 1 <= my < h - 1 and 1 <= mx < w - 1:
+                        idx = pane.index_at(my - 1)
+                        if idx is not None:
+                            pane.select(idx)
+                            return pane.selected.data
+            continue
         if name in ("esc", "q"):
             return None
         if name == "enter":

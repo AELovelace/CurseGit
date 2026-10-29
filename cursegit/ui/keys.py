@@ -109,6 +109,8 @@ def help_lines(scope: str) -> list[str]:
     lines += [
         "Mouse",
         "",
+        "  click action button  Run the labeled command",
+        "  right-click row      Open actions for that row",
         "  click tab            Switch tab",
         "  click row            Select it (and focus the list)",
         "  double-click row     Same as Enter on it",

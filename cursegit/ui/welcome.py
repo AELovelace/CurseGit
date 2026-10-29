@@ -9,7 +9,7 @@ import os
 
 from ..git import GitError, GitRepo
 from . import popups
-from .draw import display_width, key_name, put, read_key
+from .draw import CLICK, DOUBLE_CLICK, WHEEL_UP, WHEEL_DOWN, enable_mouse, display_width, key_name, put, read_key, read_mouse
 from .panes import ListPane, Row
 from .theme import A, init_theme
 
@@ -27,7 +27,7 @@ def default_clone_dest(url: str, parent: str) -> str:
     return os.path.join(parent, name or "repo")
 
 
-def welcome(scr, path: str) -> GitRepo | None:
+def welcome(scr, path: str, mouse: bool = True) -> GitRepo | None:
     """Return a repository to open, or None if the user chose to quit."""
     init_theme()
     try:
@@ -36,6 +36,8 @@ def welcome(scr, path: str) -> GitRepo | None:
         pass
     scr.keypad(True)
     scr.timeout(-1)
+    if mouse:
+        enable_mouse()
     target = os.path.abspath(path)
     menu = ListPane()
     menu.set_rows([Row(f"[{key}]  {label}", data=action, key=action) for action, key, label in OPTIONS])
@@ -43,13 +45,26 @@ def welcome(scr, path: str) -> GitRepo | None:
     message_err = False
 
     while True:
-        _draw(scr, target, menu, message, message_err)
+        x0, y0, width = _draw(scr, target, menu, message, message_err)
         name = key_name(read_key(scr))
         if name == "resize":
             scr.clear()
             continue
         action = None
-        if name in ("down", "j"):
+        if name == "mouse":
+            ev = read_mouse()
+            if ev:
+                mx, my, buttons = ev
+                if buttons & WHEEL_UP:
+                    menu.move(-1)
+                elif buttons & WHEEL_DOWN:
+                    menu.move(1)
+                elif buttons & (CLICK | DOUBLE_CLICK) and x0 <= mx < x0 + width:
+                    idx = menu.index_at(my - y0) if y0 <= my < y0 + len(OPTIONS) else None
+                    if idx is not None:
+                        menu.select(idx)
+                        action = menu.selected.data
+        elif name in ("down", "j"):
             menu.move(1)
         elif name in ("up", "k"):
             menu.move(-1)
@@ -104,7 +119,7 @@ def _clone_flow(scr, parent: str) -> tuple[GitRepo | None, str]:
     return repo, ""
 
 
-def _draw(scr, target: str, menu: ListPane, message: str, message_err: bool) -> None:
+def _draw(scr, target: str, menu: ListPane, message: str, message_err: bool):
     scr.erase()
     H, W = scr.getmaxyx()
     put(scr, 0, 0, "", A["header"])
@@ -113,7 +128,7 @@ def _draw(scr, target: str, menu: ListPane, message: str, message_err: bool) -> 
         "No git repository here:",
         target,
         "",
-        "Pick one (arrows + Enter, or the letter):",
+        "Click an option (or use arrows + Enter):",
     ]
     width = min(W - 4, max(60, display_width(target) + 6))
     x0 = max(0, (W - width) // 2)
@@ -126,3 +141,4 @@ def _draw(scr, target: str, menu: ListPane, message: str, message_err: bool) -> 
         put(scr, y + len(lines) + len(OPTIONS) + 1, x0, message, A["error"] if message_err else A["ok"], width, ellipsis=True)
     put(scr, H - 1, 1, "cursegit init [path]  /  cursegit clone <url> [dest] also work from the command line", A["dim"])
     scr.refresh()
+    return x0, y + len(lines), width

@@ -81,3 +81,20 @@ python -m unittest discover -s tests -v
 ```
 
 See `PLAN.md` for the design and roadmap.
+
+## Mouse controls and responsiveness
+
+Click the action buttons below the panes, or right-click a row for its actions menu.
+The Actions button provides commands that do not fit in a narrow window. Pickers,
+confirmation choices, text-editor Save/Cancel buttons, and the welcome screen accept clicks.
+Clicking inside an editor moves its caret. Keyboard shortcuts remain available.
+
+Mouse presses respond immediately; releases never execute an action twice. Diff previews
+load on a background thread, rapid navigation keeps only the latest pending selection, and
+recent previews are cached until refresh. Periodic status scans run in the background too.
+Rendering clips long lines before processing their hidden text, and hover events no longer
+redraw the entire screen. Initial scans, explicit actions, and opening a full-screen detail
+may still wait for Git.
+
+See CONTRIBUTOR_GUIDE.md for editable development and TESTING_GUIDE.md for regression
+checks and the repeatable rendering benchmark.

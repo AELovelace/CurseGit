@@ -26,37 +26,38 @@ def display_width(s: str) -> int:
     return sum(cell_width(c) for c in s)
 
 
-def sanitize(s: str, tab: int = 4) -> str:
-    out = []
+def sanitize(s: str, tab: int = 4, max_cells: int | None = None) -> str:
+    out, used = [], 0
     for ch in s:
-        if ch == "\t":
-            out.append(" " * tab)
-        elif ch in "\r\n":
+        if ch in "\r\n":
             continue
-        elif unicodedata.category(ch) == "Cc":
-            out.append("?")
-        else:
-            out.append(ch)
+        piece = " " * tab if ch == "\t" else ("?" if unicodedata.category(ch) == "Cc" else ch)
+        out.append(piece)
+        if max_cells is not None:
+            used += display_width(piece)
+            if used > max_cells:
+                break  # Include the overflowing character so clip() can add its ellipsis.
     return "".join(out)
 
 
 def clip(s: str, width: int, ellipsis: bool = False) -> str:
-    """Truncate `s` to at most `width` cells."""
+    """Clip in one pass, stopping as soon as the visible cells are filled."""
     if width <= 0:
         return ""
-    if display_width(s) <= width:
-        return s
-    if ellipsis and width > 1:
-        width -= 1
-    out = []
-    used = 0
+    out, widths, used = [], [], 0
     for ch in s:
-        w = cell_width(ch)
-        if used + w > width:
-            break
+        size = cell_width(ch)
+        if used + size > width:
+            if ellipsis:
+                while out and used > width - 1:
+                    out.pop()
+                    used -= widths.pop()
+                out.append(ELLIPSIS)
+            return "".join(out)
         out.append(ch)
-        used += w
-    return "".join(out) + (ELLIPSIS if ellipsis else "")
+        widths.append(size)
+        used += size
+    return s
 
 
 def skip_cells(s: str, n: int) -> str:
@@ -86,7 +87,7 @@ def put(win, y: int, x: int, s: str, attr: int = 0, width: int | None = None, el
         width = avail
     if width <= 0:
         return
-    text = fit(sanitize(s), width, ellipsis)
+    text = fit(sanitize(s, max_cells=width + 2), width, ellipsis)
     try:
         win.addstr(y, x, text, attr)
     except curses.error:
@@ -158,17 +159,18 @@ _SPECIAL = {
 
 # Mouse button state bits. windows-curses translates PDCurses wheel events into the ncurses
 # BUTTON4/BUTTON5 "pressed" bits; raw PDCurses builds use 0x10000/0x20000 for the wheel.
-WHEEL_UP = getattr(curses, "BUTTON4_PRESSED", 0) | (0x10000 if sys.platform == "win32" else 0)
-WHEEL_DOWN = getattr(curses, "BUTTON5_PRESSED", 0) | (0x20000 if sys.platform == "win32" else 0)
-CLICK = getattr(curses, "BUTTON1_CLICKED", 0) | getattr(curses, "BUTTON1_PRESSED", 0) \
-    | getattr(curses, "BUTTON1_RELEASED", 0)
+WHEEL_UP = getattr(curses, "BUTTON4_PRESSED", 0x10000 if sys.platform == "win32" else 0)
+WHEEL_DOWN = getattr(curses, "BUTTON5_PRESSED", 0x20000 if sys.platform == "win32" else 0)
+CLICK = getattr(curses, "BUTTON1_CLICKED", 0) | getattr(curses, "BUTTON1_PRESSED", 0)
 DOUBLE_CLICK = getattr(curses, "BUTTON1_DOUBLE_CLICKED", 0)
+RIGHT_CLICK = getattr(curses, "BUTTON3_CLICKED", 0) | getattr(curses, "BUTTON3_PRESSED", 0)
 
 
 def enable_mouse() -> bool:
     """Ask curses for mouse events. Returns False when the terminal has no mouse support."""
     try:
-        avail, _old = curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
+        avail, _old = curses.mousemask(curses.ALL_MOUSE_EVENTS)  # No hover flood; clicks and wheel still arrive.
+        curses.mouseinterval(0)  # Respond immediately; the app detects double-clicks from presses.
     except (curses.error, AttributeError):
         return False
     return bool(avail)
