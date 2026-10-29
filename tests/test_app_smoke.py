@@ -209,11 +209,22 @@ class AppSmoke(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(self.work, "c.txt")))
         self.assertGreaterEqual(len(st.files), 2)
 
+    def test_stage_all_from_other_tab(self):
+        application, harness = self.run_app(["4", "S", "U", "q"])
+        self.assertEqual(application.tab, 0)
+        joined = chr(10).join(harness.frames)
+        self.assertIn("Staged all changes (3 file(s))", joined)
+        self.assertIn("Unstaged all changes", joined)
+        self.assertEqual(self.repo.status().staged_count, 0)
+
     def test_network_without_remote_reports_error(self):
-        keys = ["f", WAIT, "p", "P", "q"]
+        keys = ["f", WAIT, "p", "P", "n", "q"]   # P with no remote offers Publish to GitHub; answer no
         application, harness = self.run_app(keys)
-        self.assertTrue(application.msg_err)
-        self.assertIn("No remote configured", application.msg)
+        joined = "\n".join(harness.frames)
+        self.assertIn("fetch", joined.lower())
+        self.assertIn("No upstream branch to pull from", joined)
+        self.assertIn("Sign in to GitHub to publish it", joined)
+        self.assertIn("git remote add origin", application.msg)
 
     def test_branch_and_stash_actions(self):
         keys = [
@@ -296,6 +307,25 @@ class AppSmoke(unittest.TestCase):
         self.assertEqual(self.repo.remotes(), ["origin"])
         self.assertEqual(self.repo.status().branch.upstream, "origin/main")
         self.assertEqual(self.repo.extra_flags, [])
+
+    def test_push_without_remote_offers_publish(self):
+        from cursegit import github
+        bare = os.path.join(self.tmp, "fake-github.git")
+        _git(self.tmp, "init", "-q", "--bare", "-b", "main", bare)
+        created = {"clone_url": bare.replace("\\", "/"), "html_url": "https://github.com/edith/work"}
+        github.save_auth(github.Auth(token="t", login="edith", source="pat"))
+        keys = ["P", "y", "\n", "2", WAIT, "q"]   # P -> "publish to GitHub?" yes -> default name -> Public
+        with mock.patch.object(github, "create_repo", lambda tok, name, private, description="": created):
+            application, harness = self.run_app(keys)
+        self.assertIn("Published to https://github.com/edith/work", application.msg)
+        self.assertIn("Publish it to GitHub as @edith?", "\n".join(harness.frames))
+        self.assertEqual(self.repo.remotes(), ["origin"])
+        self.assertTrue(application.has_remote)
+
+    def test_push_without_remote_not_signed_in_offers_login(self):
+        application, harness = self.run_app(["P", "n", "q"])
+        self.assertIn("P publish to GitHub", "\n".join(harness.frames))
+        self.assertIn("Cancelled", application.msg)
 
     def test_github_device_flow_cancel(self):
         from cursegit import github

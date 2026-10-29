@@ -31,7 +31,7 @@ Press `?` inside the app for the full list. The essentials:
 | `S` / `U` | Stage all / unstage all |
 | `d` / `D` | Discard file / discard all working tree changes (asks first) |
 | `c` / `C` | Commit / amend (Ctrl-S saves the message, Esc cancels) |
-| `f` `p` `P` `y` | Fetch, pull, push, sync. Push publishes the branch if it has no upstream |
+| `f` `p` `P` `y` | Fetch, pull, push, sync. Push publishes the branch if it has no upstream, and offers **Publish to GitHub** if the repo has no remote at all |
 | `z` / `Z` | Stash / stash including untracked |
 | `e` | Open the file in `$EDITOR` (use this to resolve conflicts, then `s`) |
 | `o` | Open the remote in your browser |

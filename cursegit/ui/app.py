@@ -23,10 +23,10 @@ SPINNER = "|/-\\"
 SPLIT_MIN_WIDTH = 90
 
 HINTS = {
-    "status": "↑↓ move  ←→ panes  [ ] tabs  s stage  u unstage  c commit  p pull  P push  y sync  @ github  ? help",
-    "branches": "↑↓ move  ←→ panes  [ ] tabs  Enter checkout  n new  D delete  m merge  ? help",
-    "stash": "↑↓ move  ←→ panes  [ ] tabs  a apply  A pop  D drop  z stash  ? help",
-    "log": "↑↓ move  ←→ panes  [ ] tabs  Enter show  b branch here  ? help",
+    "status": "s stage  u unstage  c commit  p pull  P push  y sync  @ github  ? help",
+    "branches": "Enter checkout  n new  D delete  m merge  [ ] tabs  ? help",
+    "stash": "a apply  A pop  D drop  z stash  [ ] tabs  ? help",
+    "log": "Enter show  b branch here  [ ] tabs  ? help",
 }
 
 
@@ -40,6 +40,7 @@ class App:
         self.mouse_on = False
         self.geom: dict = {}   # where things were drawn last frame, for mouse hit-testing
         self.auth = github.load_auth()
+        self.has_remote = True
         self.pending_login: github.DeviceCode | None = None
         self.login_cancel = threading.Event()
         self._apply_auth()
@@ -149,6 +150,10 @@ class App:
             self.fail(e)
             self.state = RepoState()
         self.last_refresh = time.monotonic()
+        try:
+            self.has_remote = bool(self.repo.remotes())
+        except GitError:
+            self.has_remote = True
         self.rebuild_rows()
         self.update_detail(force=True)
         self.need_draw = True
@@ -338,14 +343,21 @@ class App:
 
     def _draw_status(self, H: int, W: int) -> None:
         hint = HINTS[self.scope]
+        if not self.has_remote and self.scope == "status":
+            hint = "P publish to GitHub  " + hint
+        hint_w = display_width(hint)
+        msg_w = 0
         if self.msg:
-            avail = W - display_width(hint) - 3
-            if avail < 20:
-                hint = ""
-                avail = W - 1
-            put(self.scr, H - 1, 1, self.msg, A["error"] if self.msg_err else A["ok"], avail, ellipsis=True)
-        if hint:
-            put(self.scr, H - 1, W - display_width(hint) - 1, hint, A["dim"])
+            # The message has priority; when both do not fit, the hints collapse to "? help".
+            msg_w = display_width(self.msg)
+            if msg_w + hint_w + 4 > W:
+                hint = "? help"
+                hint_w = display_width(hint)
+                msg_w = min(msg_w, W - hint_w - 4)
+            put(self.scr, H - 1, 1, self.msg, A["error"] if self.msg_err else A["ok"], msg_w, ellipsis=True)
+        hint_x = W - hint_w - 1
+        if hint_x >= (msg_w + 3 if self.msg else 1):
+            put(self.scr, H - 1, hint_x, hint, A["dim"], hint_w)
 
     # -- mouse ------------------------------------------------------------------
 
@@ -571,11 +583,22 @@ class App:
             self.act_stage()
 
     def act_stage_all(self) -> None:
+        if self.state.changed_count == 0 and not self.state.has_conflicts:
+            self.note("Nothing to stage")
+            return
         self.repo.stage_all()
-        self.after_mutation("Staged all changes")
+        if self.tab != 0:
+            self.switch_tab(0)
+        self.after_mutation()
+        self.note(f"Staged all changes ({self.state.staged_count} file(s))")
 
     def act_unstage_all(self) -> None:
+        if self.state.staged_count == 0:
+            self.note("Nothing staged")
+            return
         self.repo.unstage_all()
+        if self.tab != 0:
+            self.switch_tab(0)
         self.after_mutation("Unstaged all changes")
 
     def act_discard(self) -> None:
@@ -707,7 +730,18 @@ class App:
             return None
         remotes = self.repo.remotes()
         if not remotes:
-            self.note("No remote configured. Add one with: git remote add origin <url>", err=True)
+            # VS Code behaviour: with no remote, "Publish Branch" becomes "Publish to GitHub".
+            if self.auth.signed_in:
+                if popups.confirm(self.scr, "Publish", f"This repository has no remote yet. "
+                                  f"Publish it to GitHub as @{self.auth.login}?"):
+                    self._publish()
+                else:
+                    self.note("Cancelled. To use another host: git remote add origin <url>")
+            elif popups.confirm(self.scr, "Publish", "This repository has no remote yet. "
+                                "Sign in to GitHub to publish it there?"):
+                self.act_github()
+            else:
+                self.note("Cancelled. To use another host: git remote add origin <url>")
             return None
         if len(remotes) == 1:
             return remotes[0]

@@ -67,6 +67,11 @@ class ListPane:
     def has_code_column(self) -> bool:
         return any(r.code for r in self.rows)
 
+    @property
+    def code_width(self) -> int:
+        """Width of the status/hash column: widest code, at least 2."""
+        return max((len(r.code) for r in self.rows), default=0) or 2
+
     # -- navigation ---------------------------------------------------------
 
     def move(self, delta: int) -> None:
@@ -118,6 +123,7 @@ class ListPane:
             self.top = self.cursor - h + 1
         self.top = max(0, min(self.top, max(0, n - h)))
         code_col = self.has_code_column
+        code_w = max(2, self.code_width)
         for i in range(h):
             idx = self.top + i
             if idx >= n:
@@ -130,9 +136,9 @@ class ListPane:
             col += 1
             # A selected row is drawn entirely in the selection color: color pairs cannot be OR-ed together.
             if r.selectable and code_col:
-                code = f" {r.code:<2} "
-                put(win, y + i, col, code, base if sel else r.code_attr, 4)
-                col += 4
+                code = f" {r.code:<{code_w}} "
+                put(win, y + i, col, code, base if sel else r.code_attr, code_w + 2)
+                col += code_w + 2
             else:
                 col += 1
             put(win, y + i, col, r.text, base if sel else r.attr, x + w - col, ellipsis=True)
